@@ -1,0 +1,13 @@
+# Core dependencies
+numpy>=1.19.0
+
+# Development dependencies (optional)
+pytest>=6.0
+pytest-cov>=2.0
+black>=21.0
+flake8>=3.9
+mypy>=0.900
+
+# Documentation dependencies (optional)
+sphinx>=4.0
+sphinx-rtd-theme>=0.5
