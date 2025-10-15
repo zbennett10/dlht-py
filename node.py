@@ -7,6 +7,7 @@ import struct
 import threading
 import time
 import logging
+import hashlib
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Tuple
@@ -46,7 +47,8 @@ class LEADNode:
         self.learned_hash = RecursiveModelIndex(
             branching_factor=self.config.branching_factor,
             model_type=self.config.model_type,
-            hash_space_size=self.hash_space_size
+            hash_space_size=self.hash_space_size,
+            stage1_model_type=self.config.stage1_model_type
         )
         self.learned_hash_lock = threading.RLock()
         
@@ -68,11 +70,15 @@ class LEADNode:
         logger.info(f"Starting LEAD node at {self.ip}:{self.base_port}")
         
         # Create virtual nodes
+        # All virtual nodes share the same port (base_port) since they're logical entities
+        # on the same physical node. VID is generated using a salt to distribute them in hash space.
         for i in range(self.num_virtual_nodes):
-            port = self.base_port + i
-            vid = peer_hash(self.ip, port)
+            # Generate unique VID for each virtual node using salt
+            vid_data = f"{self.ip}:{self.base_port}:vnode{i}".encode()
+            vid = int.from_bytes(hashlib.sha1(vid_data).digest(), 'big')
+
             vnode = LEADPeer(
-                vid, self.ip, port, self,
+                vid, self.ip, self.base_port, self,
                 self.hash_space_size,
                 self.config.model_update_threshold
             )
@@ -87,7 +93,10 @@ class LEADNode:
         self.running = True
         self.server_thread = threading.Thread(target=self._run_server, daemon=True)
         self.server_thread.start()
-        
+
+        # Give server time to start listening (especially important in Docker)
+        time.sleep(0.5)
+
         # Join network
         if self.bootstrap_peer:
             self._join_network()
@@ -126,41 +135,53 @@ class LEADNode:
     def _join_network(self):
         """Join existing network via bootstrap peer"""
         logger.info(f"Joining network via bootstrap peer {self.bootstrap_peer}")
-        
+
+        # Retry joining if bootstrap peer isn't ready yet
+        max_retries = 5
+        retry_delay = 2  # seconds
+
         for vnode in self.virtual_nodes.values():
-            try:
-                # Find successor via bootstrap
-                successor = self.rpc_find_successor(
-                    self.bootstrap_peer[0], self.bootstrap_peer[1], vnode.vid)
-                    
-                vnode.successor = successor
-                vnode.predecessor = None
-                
-                # Update finger table
-                vnode.update_finger_table()
-                
-                # Notify successor
-                self.rpc_notify(successor.ip, successor.port,
-                               FingerEntry(vnode.vid, vnode.ip, vnode.port))
-                               
-                # Request key transfer
-                self._rpc_request_keys(successor.ip, successor.port, 
-                                      successor.vid, vnode.vid)
-                
-                logger.debug(f"Virtual node {vnode.vid} joined network")
-                
-            except Exception as e:
-                logger.error(f"Failed to join network for vnode {vnode.vid}: {e}")
+            for attempt in range(max_retries):
+                try:
+                    # Find successor via bootstrap
+                    successor = self.rpc_find_successor(
+                        self.bootstrap_peer[0], self.bootstrap_peer[1], vnode.vid)
+
+                    vnode.successor = successor
+                    vnode.predecessor = None
+
+                    # Update finger table
+                    vnode.update_finger_table()
+
+                    # Notify successor
+                    self.rpc_notify(successor.ip, successor.port,
+                                   FingerEntry(vnode.vid, vnode.ip, vnode.port))
+
+                    # Request key transfer
+                    self._rpc_request_keys(successor.ip, successor.port,
+                                          successor.vid, vnode.vid)
+
+                    logger.info(f"Virtual node {vnode.vid} successfully joined network")
+                    break  # Success, exit retry loop
+
+                except Exception as e:
+                    if attempt < max_retries - 1:
+                        logger.warning(f"Join attempt {attempt + 1}/{max_retries} failed for vnode {vnode.vid}: {e}. Retrying in {retry_delay}s...")
+                        time.sleep(retry_delay)
+                    else:
+                        logger.error(f"Failed to join network for vnode {vnode.vid} after {max_retries} attempts: {e}")
                 
     def _run_server(self):
         """Run RPC server"""
         try:
             self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self.server_socket.bind((self.ip, self.base_port))
+            # Bind to 0.0.0.0 to accept connections from all interfaces (required for Docker)
+            bind_ip = '0.0.0.0'
+            self.server_socket.bind((bind_ip, self.base_port))
             self.server_socket.listen(100)
-            
-            logger.info(f"RPC server listening on {self.ip}:{self.base_port}")
+
+            logger.info(f"RPC server listening on {bind_ip}:{self.base_port} (advertised as {self.ip}:{self.base_port})")
             
             while self.running:
                 try:
@@ -177,13 +198,17 @@ class LEADNode:
     def _handle_connection(self, conn: socket.socket):
         """Handle incoming RPC connection"""
         try:
+            logger.debug(f"Handling incoming RPC connection")
             # Read header
             header = conn.recv(4)
+            logger.debug(f"Received header: {len(header)} bytes")
             if len(header) < 4:
+                logger.warning("Incomplete header received")
                 return
-                
+
             msg_len = struct.unpack('!I', header)[0]
-            
+            logger.debug(f"Expecting message of {msg_len} bytes")
+
             # Read message
             data = b''
             while len(data) < msg_len:
@@ -191,18 +216,23 @@ class LEADNode:
                 if not chunk:
                     break
                 data += chunk
-                
+            logger.debug(f"Received {len(data)} bytes of message data")
+
             msg_type, payload = RPCMessage.decode(data)
-            
+            logger.debug(f"Decoded RPC request: {msg_type}")
+
             # Route to handler
             response = self._handle_rpc(msg_type, payload)
-            
+            logger.debug(f"Generated response for {msg_type}")
+
             # Send response
             response_data = RPCMessage.encode('response', response)
+            logger.debug(f"Sending response: {len(response_data)} bytes")
             conn.sendall(response_data)
-            
+            logger.debug(f"Response sent successfully for {msg_type}")
+
         except Exception as e:
-            logger.error(f"Error handling connection: {e}")
+            logger.error(f"Error handling connection: {e}", exc_info=True)
         finally:
             conn.close()
             
@@ -225,11 +255,25 @@ class LEADNode:
                     vnode = self.virtual_nodes[vnode_vid]
                 else:
                     vnode = list(self.virtual_nodes.values())[0]
-                
+
                 if vnode.predecessor:
                     return {
                         'success': True,
                         'predecessor': vnode.predecessor.to_dict()
+                    }
+                return {'success': False}
+
+            elif msg_type == 'get_successor':
+                vnode_vid = payload.get('vnode_vid')
+                if vnode_vid and vnode_vid in self.virtual_nodes:
+                    vnode = self.virtual_nodes[vnode_vid]
+                else:
+                    vnode = list(self.virtual_nodes.values())[0]
+
+                if vnode.successor:
+                    return {
+                        'success': True,
+                        'successor': vnode.successor.to_dict()
                     }
                 return {'success': False}
                 
@@ -342,36 +386,74 @@ class LEADNode:
         # Find responsible node
         vnode = self._get_vnode_for_hash(hash_value)
         successor = vnode.find_successor(hash_value)
-        
+
         # Store locally or forward
-        if successor.vid == vnode.vid:
-            vnode.put(key, value)
+        if successor.ip == self.ip and successor.port == self.base_port:
+            # Successor is a local vnode
+            if successor.vid in self.virtual_nodes:
+                self.virtual_nodes[successor.vid].put(key, value)
+            else:
+                # Shouldn't happen, but fallback to original vnode
+                vnode.put(key, value)
         else:
+            # Successor is on a different node
             self.rpc_put(successor.ip, successor.port, key, value)
             
     def get(self, key: int) -> Optional[Any]:
         """
         Retrieve value by key
-        
+
         Args:
             key: Integer key
-            
+
         Returns:
             Value associated with key, or None if not found
         """
         if not self.ready:
             raise NodeNotReadyException("Node is not ready")
-            
+
         with self.learned_hash_lock:
             hash_value = self.learned_hash.predict(key)
-            
+
+        logger.debug(f"get({key}): predicted hash={hash_value}")
+
         vnode = self._get_vnode_for_hash(hash_value)
         successor = vnode.find_successor(hash_value)
-        
-        if successor.vid == vnode.vid:
-            return vnode.get(key)
+
+        logger.debug(f"get({key}): vnode={vnode.vid}, successor={successor.vid} at {successor.ip}:{successor.port}")
+
+        # Check if successor is a local vnode (same IP and port as this node)
+        if successor.ip == self.ip and successor.port == self.base_port:
+            logger.debug(f"get({key}): successor is local, checking local vnodes")
+
+            # Try to get from the specific successor vnode first
+            if successor.vid in self.virtual_nodes:
+                result = self.virtual_nodes[successor.vid].get(key)
+                logger.debug(f"get({key}): local vnode {successor.vid} returned {result}")
+                if result is not None:
+                    return result
+
+            # Fallback: check all local vnodes (handles case where model was retrained)
+            logger.debug(f"get({key}): checking all {len(self.virtual_nodes)} local vnodes")
+            for vid, local_vnode in self.virtual_nodes.items():
+                value = local_vnode.get(key)
+                logger.debug(f"get({key}): checking vnode {vid}, got {value}")
+                if value is not None:
+                    logger.info(f"get({key}): found in local vnode {vid}")
+                    return value
+
+            logger.warning(f"get({key}): not found in any local vnode")
+            return None
         else:
-            return self.rpc_get(successor.ip, successor.port, key)
+            # Successor is on a different node - use RPC
+            logger.debug(f"get({key}): trying RPC to remote successor {successor.ip}:{successor.port}")
+            try:
+                result = self.rpc_get(successor.ip, successor.port, key)
+                logger.debug(f"get({key}): RPC returned {result}")
+                return result
+            except (RPCException, Exception) as e:
+                logger.error(f"get({key}): RPC failed with {e}")
+                return None
             
     def range_query(self, start_key: int, count: int) -> List[Tuple[int, Any]]:
         """
@@ -442,8 +524,6 @@ class LEADNode:
                 logger.error(f"Error in range query: {e}")
                 break
                     
-        return results
-        
     def retrain_model(self, sample_keys: Optional[np.ndarray] = None):
         """
         Retrain the learned hash function
@@ -456,10 +536,24 @@ class LEADNode:
             if sample_keys is None:
                 # Collect keys from all virtual nodes
                 all_keys = []
-                for vnode in self.virtual_nodes.values():
+                logger.info(f"Collecting keys from {len(self.virtual_nodes)} virtual nodes")
+                
+                for vnode_id, vnode in self.virtual_nodes.items():
                     with vnode.lock:
-                        all_keys.extend(vnode.storage.keys())
+                        storage_keys = list(vnode.storage.keys())
+                        logger.info(f"VNode {vnode_id}: found {len(storage_keys)} keys")
                         
+                        # Convert keys to numeric format
+                        for key in storage_keys:
+                            try:
+                                numeric_key = float(key)
+                                all_keys.append(numeric_key)
+                            except (ValueError, TypeError):
+                                logger.warning(f"Skipping non-numeric key: {key}")
+                                continue
+                        
+                logger.info(f"Total keys collected: {len(all_keys)}")
+                
                 if not all_keys:
                     logger.warning("No keys to train model on")
                     return
@@ -475,7 +569,39 @@ class LEADNode:
                     vnode.update_ready = False
                     
             logger.info(f"Model retrained with {len(sample_keys)} keys, "
-                       f"version {self.learned_hash.version}")
+                    f"version {self.learned_hash.version}") 
+    # def retrain_model(self, sample_keys: Optional[np.ndarray] = None):
+    #     """
+    #     Retrain the learned hash function
+        
+    #     Args:
+    #         sample_keys: Optional array of keys to train on. 
+    #                     If None, collects keys from all virtual nodes
+    #     """
+    #     with self.learned_hash_lock:
+    #         if sample_keys is None:
+    #             # Collect keys from all virtual nodes
+    #             all_keys = []
+    #             for vnode in self.virtual_nodes.values():
+    #                 with vnode.lock:
+    #                     all_keys.extend(vnode.storage.keys())
+                        
+    #             if not all_keys:
+    #                 logger.warning("No keys to train model on")
+    #                 return
+                    
+    #             sample_keys = np.array(sorted(all_keys))
+                
+    #         self.learned_hash.train(sample_keys)
+            
+    #         # Reset new key counters
+    #         for vnode in self.virtual_nodes.values():
+    #             with vnode.lock:
+    #                 vnode.new_keys_count = 0
+    #                 vnode.update_ready = False
+                    
+    #         logger.info(f"Model retrained with {len(sample_keys)} keys, "
+    #                    f"version {self.learned_hash.version}")
             
     def federated_model_update(self):
         """Perform federated model update across virtual nodes"""
@@ -563,36 +689,48 @@ class LEADNode:
     def _send_rpc(self, ip: str, port: int, msg_type: str, payload: dict) -> dict:
         """Send RPC request and get response"""
         try:
+            logger.debug(f"Sending RPC {msg_type} to {ip}:{port}")
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(self.config.rpc_timeout)
+
+            logger.debug(f"Connecting to {ip}:{port}...")
             sock.connect((ip, port))
-            
+            logger.debug(f"Connected to {ip}:{port}")
+
             # Send request
             request = RPCMessage.encode(msg_type, payload)
+            logger.debug(f"Sending request of {len(request)} bytes")
             sock.sendall(request)
-            
+            logger.debug(f"Request sent, waiting for response...")
+
             # Receive response
             header = sock.recv(4)
+            logger.debug(f"Received header: {len(header)} bytes")
             if len(header) < 4:
                 return {'success': False, 'error': 'Invalid response'}
-                
+
             msg_len = struct.unpack('!I', header)[0]
-            
+            logger.debug(f"Expecting response of {msg_len} bytes")
+
             data = b''
             while len(data) < msg_len:
                 chunk = sock.recv(min(msg_len - len(data), 4096))
                 if not chunk:
                     break
                 data += chunk
-                
+            logger.debug(f"Received {len(data)} bytes of data")
+
             _, response = RPCMessage.decode(data)
             sock.close()
-            
+            logger.debug(f"RPC {msg_type} completed successfully")
+
             return response
-            
+
         except socket.timeout:
+            logger.error(f"RPC timeout to {ip}:{port} for {msg_type}")
             raise RPCException(f"RPC timeout to {ip}:{port}")
         except Exception as e:
+            logger.error(f"RPC error to {ip}:{port} for {msg_type}: {e}")
             raise RPCException(f"RPC error to {ip}:{port}: {e}")
             
     def rpc_find_successor(self, ip: str, port: int, key_hash: int) -> FingerEntry:
@@ -608,9 +746,17 @@ class LEADNode:
     def rpc_get_predecessor(self, ip: str, port: int) -> Optional[FingerEntry]:
         """RPC: Get predecessor of a node"""
         response = self._send_rpc(ip, port, 'get_predecessor', {})
-        
+
         if response.get('success') and 'predecessor' in response:
             return FingerEntry.from_dict(response['predecessor'])
+        return None
+
+    def rpc_get_successor(self, ip: str, port: int) -> Optional[FingerEntry]:
+        """RPC: Get successor of a node"""
+        response = self._send_rpc(ip, port, 'get_successor', {})
+
+        if response.get('success') and 'successor' in response:
+            return FingerEntry.from_dict(response['successor'])
         return None
         
     def rpc_notify(self, ip: str, port: int, potential_pred: FingerEntry):

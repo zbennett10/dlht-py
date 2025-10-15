@@ -7,6 +7,7 @@ import time
 import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
+from sortedcontainers import SortedDict
 
 logger = logging.getLogger(__name__)
 
@@ -53,8 +54,8 @@ class LEADPeer:
         self.successor_list: List[FingerEntry] = []  # Backup successors
         self.predecessor_list: List[FingerEntry] = []  # Backup predecessors
         
-        # Data storage
-        self.storage: Dict[int, KeyValuePair] = {}
+        # Data storage (using SortedDict for efficient range queries)
+        self.storage: SortedDict[int, KeyValuePair] = SortedDict()
         
         # Model update tracking
         self.new_keys_count = 0
@@ -124,22 +125,48 @@ class LEADPeer:
         with self.lock:
             if self.successor is None:
                 return
-                
+
             # Ask successor for its predecessor
             try:
                 x = self.physical_node.rpc_get_predecessor(
                     self.successor.ip, self.successor.port)
-                    
+
                 if x is not None and self.in_range(x.vid, self.vid, self.successor.vid):
                     self.successor = x
-                    
+
                 # Notify successor
                 self.physical_node.rpc_notify(
                     self.successor.ip, self.successor.port,
                     FingerEntry(self.vid, self.ip, self.port))
+
+                # Update successor list
+                self.update_successor_list()
+
             except Exception as e:
                 logger.debug(f"Stabilization error: {e}")
                 self.handle_successor_failure()
+
+    def update_successor_list(self):
+        """Update the list of backup successors"""
+        max_successors = self.physical_node.config.num_successor_backups
+        self.successor_list = []
+
+        try:
+            current = self.successor
+            for _ in range(max_successors):
+                if current.vid == self.vid:
+                    break
+
+                # Get successor's successor
+                next_succ = self.physical_node.rpc_get_successor(current.ip, current.port)
+                if next_succ and next_succ.vid != self.vid and next_succ.vid != current.vid:
+                    self.successor_list.append(next_succ)
+                    current = next_succ
+                else:
+                    break
+
+        except Exception as e:
+            logger.debug(f"Failed to update successor list: {e}")
                 
     def handle_successor_failure(self):
         """Handle successor failure by promoting backup"""
@@ -155,16 +182,30 @@ class LEADPeer:
         with self.lock:
             is_new = key not in self.storage
             self.storage[key] = KeyValuePair(key, value)
-            
+
             if is_new:
                 self.new_keys_count += 1
                 self.total_keys_count += 1
-                
+
             # Check if we need model update
-            if self.total_keys_count > 0:
-                new_ratio = self.new_keys_count / self.total_keys_count
-                if new_ratio >= self.update_threshold:
-                    self.update_ready = True
+            # Require minimum number of keys before checking update threshold
+            MIN_KEYS_FOR_UPDATE = 15
+
+            if self.total_keys_count >= MIN_KEYS_FOR_UPDATE:
+                # Check if new keys exceed threshold relative to existing keys
+                baseline_keys = self.total_keys_count - self.new_keys_count
+
+                if baseline_keys > 0:
+                    # Have a baseline - check if new keys exceed threshold
+                    new_ratio = self.new_keys_count / baseline_keys
+                    if new_ratio >= self.update_threshold:
+                        self.update_ready = True
+                else:
+                    # No baseline yet (all keys are new) - use total as baseline
+                    # This handles initial accumulation before first model training
+                    new_ratio = self.new_keys_count / self.total_keys_count
+                    if new_ratio >= self.update_threshold:
+                        self.update_ready = True
                     
     def get(self, key: int) -> Optional[Any]:
         """Retrieve a value by key"""
@@ -175,22 +216,18 @@ class LEADPeer:
     def get_range(self, start_key: int, count: int) -> List[Tuple[int, Any]]:
         """Get range of keys starting from start_key"""
         with self.lock:
-            # Get sorted keys
-            sorted_keys = sorted(self.storage.keys())
-            
-            # Find starting position
+            # SortedDict keeps keys sorted, use efficient range query
             result = []
-            collecting = False
-            
-            for key in sorted_keys:
-                if key >= start_key:
-                    collecting = True
-                    
-                if collecting:
-                    result.append((key, self.storage[key].value))
-                    if len(result) >= count:
-                        break
-                        
+
+            # Find index of first key >= start_key using binary search
+            idx = self.storage.bisect_left(start_key)
+
+            # Collect count keys starting from idx
+            keys = self.storage.keys()
+            for i in range(idx, min(idx + count, len(keys))):
+                key = keys[i]
+                result.append((key, self.storage[key].value))
+
             return result
             
     def transfer_keys(self, start: int, end: int) -> List[KeyValuePair]:

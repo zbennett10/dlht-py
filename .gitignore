@@ -2,3 +2,5 @@ examples.py
 lead_dht.egg-info
 .venv
 __pycache__
+.DS_Store
+**/*/__pycache__
